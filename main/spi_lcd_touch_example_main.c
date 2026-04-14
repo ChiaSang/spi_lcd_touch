@@ -117,23 +117,142 @@ static void example_lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uin
     esp_lcd_panel_draw_bitmap(panel_handle, offsetx1, offsety1, offsetx2 + 1, offsety2 + 1, px_map);
 }
 
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////// Touch calibration parameters ///////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+#define TOUCH_XY_SWAP       1   // 交换
+#define TOUCH_X_INV         1   // X翻转
+#define TOUCH_Y_INV         0   // Y不翻转
+#define TOUCH_X_MIN         0   // raw_Y小
+#define TOUCH_X_MAX         310 // raw_Y大
+#define TOUCH_Y_MIN         18  // raw_X小
+#define TOUCH_Y_MAX         180 // raw_X大 (按钮Y约270)
+#define TOUCH_AVG_SAMPLES   4
+
+// Touch smoothing buffer
+static int16_t s_avg_buf_x[TOUCH_AVG_SAMPLES] = {0};
+static int16_t s_avg_buf_y[TOUCH_AVG_SAMPLES] = {0};
+static uint8_t s_avg_last = 0;
+
+/**
+ * @brief Apply calibration correction to raw touch coordinates
+ */
+static void touch_corr(int16_t *x, int16_t *y)
+{
+    // Swap XY if configured
+    if (TOUCH_XY_SWAP) {
+        int16_t tmp = *x;
+        *x = *y;
+        *y = tmp;
+    }
+
+    // Calculate screen X from raw value
+    if (TOUCH_X_MAX > TOUCH_X_MIN) {
+        // Normal: value increases → screen coordinate increases
+        if (*x > TOUCH_X_MIN) {
+            *x -= TOUCH_X_MIN;
+        } else {
+            *x = 0;
+        }
+        *x = (int16_t)((uint32_t)(*x) * EXAMPLE_LCD_H_RES / (TOUCH_X_MAX - TOUCH_X_MIN));
+    } else {
+        // Reversed: value increases → screen coordinate decreases
+        if (*x < TOUCH_X_MIN) {
+            *x = TOUCH_X_MIN - *x;
+        } else {
+            *x = 0;
+        }
+        *x = (int16_t)((uint32_t)(*x) * EXAMPLE_LCD_H_RES / (TOUCH_X_MIN - TOUCH_X_MAX));
+        if (*x > EXAMPLE_LCD_H_RES) *x = EXAMPLE_LCD_H_RES;
+    }
+
+    // Calculate screen Y from raw value
+    if (TOUCH_Y_MAX > TOUCH_Y_MIN) {
+        // Normal: value increases → screen coordinate increases
+        if (*y > TOUCH_Y_MIN) {
+            *y -= TOUCH_Y_MIN;
+        } else {
+            *y = 0;
+        }
+        *y = (int16_t)((uint32_t)(*y) * EXAMPLE_LCD_V_RES / (TOUCH_Y_MAX - TOUCH_Y_MIN));
+    } else {
+        // Reversed: value increases → screen coordinate decreases
+        if (*y < TOUCH_Y_MIN) {
+            *y = TOUCH_Y_MIN - *y;
+        } else {
+            *y = 0;
+        }
+        *y = (int16_t)((uint32_t)(*y) * EXAMPLE_LCD_V_RES / (TOUCH_Y_MIN - TOUCH_Y_MAX));
+        if (*y > EXAMPLE_LCD_V_RES) *y = EXAMPLE_LCD_V_RES;
+    }
+}
+
+/**
+ * @brief Average multiple samples to reduce jitter
+ */
+static void touch_avg(int16_t *x, int16_t *y)
+{
+    // Shift out oldest sample
+    for (int i = TOUCH_AVG_SAMPLES - 1; i > 0; i--) {
+        s_avg_buf_x[i] = s_avg_buf_x[i - 1];
+        s_avg_buf_y[i] = s_avg_buf_y[i - 1];
+    }
+
+    // Insert new sample
+    s_avg_buf_x[0] = *x;
+    s_avg_buf_y[0] = *y;
+    if (s_avg_last < TOUCH_AVG_SAMPLES) {
+        s_avg_last++;
+    }
+
+    // Calculate average
+    int32_t x_sum = 0;
+    int32_t y_sum = 0;
+    for (int i = 0; i < s_avg_last; i++) {
+        x_sum += s_avg_buf_x[i];
+        y_sum += s_avg_buf_y[i];
+    }
+    *x = x_sum / s_avg_last;
+    *y = y_sum / s_avg_last;
+}
+
 #if CONFIG_EXAMPLE_LCD_TOUCH_ENABLED
 static void example_lvgl_touch_cb(lv_indev_t *indev, lv_indev_data_t *data)
 {
     uint16_t touchpad_x[1] = {0};
     uint16_t touchpad_y[1] = {0};
     uint8_t touchpad_cnt = 0;
+    static int16_t last_x = 0;
+    static int16_t last_y = 0;
+    bool valid = false;
 
     esp_lcd_touch_handle_t touch_pad = lv_indev_get_user_data(indev);
     esp_lcd_touch_read_data(touch_pad);
-    /* Get coordinates */
+
+    // Get raw coordinates
     bool touchpad_pressed = esp_lcd_touch_get_coordinates(touch_pad, touchpad_x, touchpad_y, NULL, &touchpad_cnt, 1);
 
     if (touchpad_pressed && touchpad_cnt > 0) {
-        data->point.x = touchpad_x[0];
-        data->point.y = touchpad_y[0];
+        int16_t x = touchpad_x[0];
+        int16_t y = touchpad_y[0];
+        
+        // Apply calibration and averaging
+        touch_corr(&x, &y);
+        touch_avg(&x, &y);
+        
+        last_x = x;
+        last_y = y;
+        valid = true;
+        
+        ESP_LOGI(TAG, "Touch: raw(%d,%d) -> corr(%d,%d)", touchpad_x[0], touchpad_y[0], x, y);
+        
+        data->point.x = x;
+        data->point.y = y;
         data->state = LV_INDEV_STATE_PRESSED;
     } else {
+        s_avg_last = 0;  // Reset average buffer on release
+        data->point.x = last_x;
+        data->point.y = last_y;
         data->state = LV_INDEV_STATE_RELEASED;
     }
 }
@@ -270,9 +389,9 @@ void app_main(void)
         .rst_gpio_num = -1,
         .int_gpio_num = -1,
         .flags = {
-            .swap_xy = 0,
+            .swap_xy = 0,  // Raw data, software will handle correction
             .mirror_x = 0,
-            .mirror_y = CONFIG_EXAMPLE_LCD_MIRROR_Y,
+            .mirror_y = 0,
         },
     };
     esp_lcd_touch_handle_t tp = NULL;
