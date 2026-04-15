@@ -31,49 +31,4 @@ menu "Example Configuration"
         help
             This value is 1 if XPT2046 touch controller is selected, 0 otherwise.
 
-    config EXAMPLE_TOUCH_CALIB_ENABLE
-        bool "Enable touch auto calibration"
-        depends on EXAMPLE_LCD_TOUCH_ENABLED
-        default y
-        help
-            Enable calibration pipeline, NVS persistence and runtime calibration matrix.
-
-    config EXAMPLE_TOUCH_CALIB_FORCE_ON_BOOT
-        bool "Force calibration wizard on boot"
-        depends on EXAMPLE_TOUCH_CALIB_ENABLE
-        default n
-        help
-            Always enter calibration wizard after boot.
-
-    config EXAMPLE_TOUCH_CALIB_POINTS
-        int "Calibration points count"
-        depends on EXAMPLE_TOUCH_CALIB_ENABLE
-        range 3 5
-        default 5
-        help
-            Number of target points used by calibration wizard. Supported values are 3 or 5.
-
-    config EXAMPLE_TOUCH_CALIB_SAMPLES_PER_POINT
-        int "Samples per calibration point"
-        depends on EXAMPLE_TOUCH_CALIB_ENABLE
-        range 3 20
-        default 10
-        help
-            Number of raw samples collected while touching one target.
-
-    config EXAMPLE_TOUCH_CALIB_MAX_ERR_PX
-        int "Maximum acceptable calibration error (pixel)"
-        depends on EXAMPLE_TOUCH_CALIB_ENABLE
-        range 2 60
-        default 18
-        help
-            Calibration is rejected if max fitting error is above this threshold.
-
-    config EXAMPLE_TOUCH_CALIB_UART_CMD
-        bool "Enable UART calibration commands"
-        depends on EXAMPLE_TOUCH_CALIB_ENABLE
-        default y
-        help
-            Enable runtime command listener for: calib, calib erase, calib status.
-
 endmenu
