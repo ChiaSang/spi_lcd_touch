@@ -5,6 +5,7 @@
  */
 
 #include <stdio.h>
+#include <string.h>
 #include <unistd.h>
 #include <sys/lock.h>
 #include <sys/param.h>
@@ -20,6 +21,13 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "lvgl.h"
+#include "touch_calib_core.h"
+#include "touch_calib_store.h"
+#include "touch_calib_wizard.h"
+
+#ifndef CONFIG_EXAMPLE_TOUCH_CALIB_FORCE_ON_BOOT
+#define CONFIG_EXAMPLE_TOUCH_CALIB_FORCE_ON_BOOT 0
+#endif
 
 #if CONFIG_EXAMPLE_LCD_TOUCH_CONTROLLER_STMPE610
 #include "esp_lcd_touch_stmpe610.h"
@@ -63,6 +71,17 @@ static const char *TAG = "example";
 
 // LVGL library is not thread-safe, this example will call LVGL APIs from different tasks, so use a mutex to protect it
 static _lock_t lvgl_api_lock;
+
+#if CONFIG_EXAMPLE_LCD_TOUCH_ENABLED
+static touch_calib_blob_t s_touch_calib = {0};
+static bool s_touch_calib_enabled = false;
+static esp_lcd_touch_handle_t s_touch_pad = NULL;
+static lv_display_t *s_lvgl_display = NULL;
+#if CONFIG_EXAMPLE_TOUCH_CALIB_ENABLE
+static volatile bool s_touch_calib_wizard_requested = false;
+static volatile bool s_touch_calib_erase_requested = false;
+#endif
+#endif
 
 extern void example_lvgl_demo_ui(lv_disp_t *disp);
 
@@ -187,6 +206,206 @@ static void touch_corr(int16_t *x, int16_t *y)
     }
 }
 
+#if CONFIG_EXAMPLE_LCD_TOUCH_ENABLED
+static esp_err_t touch_build_legacy_calibration(touch_calib_blob_t *out)
+{
+    if (out == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    touch_calib_point_t pts[3] = {
+        {.raw_x = TOUCH_X_MIN, .raw_y = TOUCH_Y_MIN},
+        {.raw_x = TOUCH_X_MAX, .raw_y = TOUCH_Y_MIN},
+        {.raw_x = TOUCH_X_MIN, .raw_y = TOUCH_Y_MAX},
+    };
+
+    for (size_t i = 0; i < 3; i++) {
+        int16_t x = pts[i].raw_x;
+        int16_t y = pts[i].raw_y;
+        touch_corr(&x, &y);
+        pts[i].scr_x = x;
+        pts[i].scr_y = y;
+    }
+
+    esp_err_t err = touch_calib_solve_affine(pts, 3, out);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    out->panel_w = EXAMPLE_LCD_H_RES;
+    out->panel_h = EXAMPLE_LCD_V_RES;
+    out->version = TOUCH_CALIB_VERSION;
+    out->crc32 = touch_calib_blob_crc32(out);
+    return ESP_OK;
+}
+
+static void touch_set_legacy_runtime_calibration(void)
+{
+    touch_calib_blob_t seeded = {0};
+    esp_err_t err = touch_build_legacy_calibration(&seeded);
+    if (err == ESP_OK) {
+        s_touch_calib = seeded;
+        s_touch_calib_enabled = true;
+        ESP_LOGW(TAG, "Using legacy touch mapping fallback");
+    } else {
+        s_touch_calib_enabled = false;
+        ESP_LOGW(TAG, "Legacy touch calibration seed failed: %s", esp_err_to_name(err));
+    }
+}
+
+static void touch_load_calibration_or_fallback(bool *need_wizard)
+{
+    if (need_wizard) {
+        *need_wizard = false;
+    }
+
+    esp_err_t err = touch_calib_store_init();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Touch calibration NVS init failed: %s", esp_err_to_name(err));
+        touch_set_legacy_runtime_calibration();
+#if CONFIG_EXAMPLE_TOUCH_CALIB_ENABLE
+        if (need_wizard) {
+            *need_wizard = true;
+        }
+#endif
+        return;
+    }
+
+    touch_calib_blob_t loaded = {0};
+    bool found = false;
+    err = touch_calib_store_load(&loaded, &found);
+    if (err == ESP_OK && found && touch_calib_blob_is_valid(&loaded, EXAMPLE_LCD_H_RES, EXAMPLE_LCD_V_RES)) {
+        s_touch_calib = loaded;
+        s_touch_calib_enabled = true;
+        ESP_LOGI(TAG, "Touch calibration loaded from NVS");
+        return;
+    }
+
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Touch calibration load failed: %s", esp_err_to_name(err));
+    }
+
+    touch_set_legacy_runtime_calibration();
+
+    if (need_wizard) {
+        *need_wizard = true;
+    }
+
+    if (s_touch_calib_enabled) {
+        err = touch_calib_store_save(&s_touch_calib);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Touch calibration save failed: %s", esp_err_to_name(err));
+        } else {
+            ESP_LOGI(TAG, "Touch calibration seeded to NVS with legacy mapping");
+        }
+    }
+}
+
+#if CONFIG_EXAMPLE_TOUCH_CALIB_ENABLE
+static void touch_start_calibration_wizard(void)
+{
+    if (s_lvgl_display == NULL || s_touch_pad == NULL) {
+        return;
+    }
+
+    uint8_t points = (CONFIG_EXAMPLE_TOUCH_CALIB_POINTS == 3) ? 3 : 5;
+    touch_calib_wizard_cfg_t cfg = {
+        .display = s_lvgl_display,
+        .touch = s_touch_pad,
+        .panel_w = EXAMPLE_LCD_H_RES,
+        .panel_h = EXAMPLE_LCD_V_RES,
+        .points_count = points,
+        .samples_per_point = CONFIG_EXAMPLE_TOUCH_CALIB_SAMPLES_PER_POINT,
+        .max_err_px = (float)CONFIG_EXAMPLE_TOUCH_CALIB_MAX_ERR_PX,
+    };
+
+    esp_err_t err = touch_calib_wizard_init(&cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Touch wizard init failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    s_touch_calib_enabled = false;
+    touch_calib_wizard_start();
+    ESP_LOGI(TAG, "Touch calibration wizard started");
+}
+
+static void touch_calib_process_runtime_requests(void)
+{
+    if (s_touch_calib_erase_requested) {
+        s_touch_calib_erase_requested = false;
+        esp_err_t err = touch_calib_store_erase();
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Touch calibration erase failed: %s", esp_err_to_name(err));
+        } else {
+            ESP_LOGI(TAG, "Touch calibration erased from NVS");
+        }
+        touch_set_legacy_runtime_calibration();
+        s_touch_calib_wizard_requested = true;
+    }
+
+    if (s_touch_calib_wizard_requested && !touch_calib_wizard_is_running()) {
+        s_touch_calib_wizard_requested = false;
+        touch_start_calibration_wizard();
+    }
+
+    touch_calib_wizard_step();
+
+    touch_calib_blob_t solved = {0};
+    if (touch_calib_wizard_fetch_result(&solved)) {
+        esp_err_t err = touch_calib_store_save(&solved);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Touch calibration save failed: %s", esp_err_to_name(err));
+            touch_set_legacy_runtime_calibration();
+            return;
+        }
+
+        s_touch_calib = solved;
+        s_touch_calib_enabled = true;
+        ESP_LOGI(TAG, "Touch calibration updated and persisted to NVS");
+    }
+}
+
+#if CONFIG_EXAMPLE_TOUCH_CALIB_UART_CMD
+static void touch_calib_uart_cmd_task(void *arg)
+{
+    (void)arg;
+    char line[64] = {0};
+
+    ESP_LOGI(TAG, "Touch cmd ready: calib | calib stop | calib erase | calib status");
+    while (1) {
+        if (fgets(line, sizeof(line), stdin) == NULL) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
+        size_t len = strcspn(line, "\r\n");
+        line[len] = '\0';
+
+        if (strcmp(line, "calib") == 0) {
+            s_touch_calib_wizard_requested = true;
+            ESP_LOGI(TAG, "Calibration wizard request accepted");
+        } else if (strcmp(line, "calib stop") == 0) {
+            touch_calib_wizard_stop();
+            if (!s_touch_calib_enabled) {
+                touch_set_legacy_runtime_calibration();
+            }
+            ESP_LOGI(TAG, "Calibration wizard stopped");
+        } else if (strcmp(line, "calib erase") == 0) {
+            s_touch_calib_erase_requested = true;
+            ESP_LOGI(TAG, "Calibration erase request accepted");
+        } else if (strcmp(line, "calib status") == 0) {
+            ESP_LOGI(TAG, "calib enabled=%d running=%d state=%s",
+                     s_touch_calib_enabled,
+                     touch_calib_wizard_is_running(),
+                     touch_calib_wizard_state_name(touch_calib_wizard_get_state()));
+        }
+    }
+}
+#endif
+#endif
+#endif
+
 /**
  * @brief Average multiple samples to reduce jitter
  */
@@ -216,36 +435,56 @@ static void touch_avg(int16_t *x, int16_t *y)
     *y = y_sum / s_avg_last;
 }
 
+static bool touch_read_raw_point(esp_lcd_touch_handle_t touch, uint16_t *x, uint16_t *y)
+{
+    esp_lcd_touch_point_data_t pt = {0};
+    uint8_t point_cnt = 0;
+
+    esp_lcd_touch_read_data(touch);
+    if (esp_lcd_touch_get_data(touch, &pt, &point_cnt, 1) != ESP_OK || point_cnt == 0) {
+        return false;
+    }
+
+    *x = pt.x;
+    *y = pt.y;
+    return true;
+}
+
 #if CONFIG_EXAMPLE_LCD_TOUCH_ENABLED
 static void example_lvgl_touch_cb(lv_indev_t *indev, lv_indev_data_t *data)
 {
     uint16_t touchpad_x[1] = {0};
     uint16_t touchpad_y[1] = {0};
-    uint8_t touchpad_cnt = 0;
     static int16_t last_x = 0;
     static int16_t last_y = 0;
-    bool valid = false;
+
+#if CONFIG_EXAMPLE_TOUCH_CALIB_ENABLE
+    if (touch_calib_wizard_is_running()) {
+        data->point.x = last_x;
+        data->point.y = last_y;
+        data->state = LV_INDEV_STATE_RELEASED;
+        return;
+    }
+#endif
 
     esp_lcd_touch_handle_t touch_pad = lv_indev_get_user_data(indev);
-    esp_lcd_touch_read_data(touch_pad);
-
-    // Get raw coordinates
-    bool touchpad_pressed = esp_lcd_touch_get_coordinates(touch_pad, touchpad_x, touchpad_y, NULL, &touchpad_cnt, 1);
-
-    if (touchpad_pressed && touchpad_cnt > 0) {
+    if (touch_read_raw_point(touch_pad, &touchpad_x[0], &touchpad_y[0])) {
         int16_t x = touchpad_x[0];
         int16_t y = touchpad_y[0];
-        
-        // Apply calibration and averaging
-        touch_corr(&x, &y);
+
+        if (s_touch_calib_enabled) {
+            touch_calib_apply(&s_touch_calib, x, y, &x, &y);
+        } else {
+            touch_corr(&x, &y);
+        }
+
         touch_avg(&x, &y);
-        
+
         last_x = x;
         last_y = y;
-        valid = true;
-        
+
         ESP_LOGI(TAG, "Touch: raw(%d,%d) -> corr(%d,%d)", touchpad_x[0], touchpad_y[0], x, y);
-        
+
         data->point.x = x;
         data->point.y = y;
         data->state = LV_INDEV_STATE_PRESSED;
@@ -266,11 +505,20 @@ static void example_increase_lvgl_tick(void *arg)
 
 static void example_lvgl_port_task(void *arg)
 {
+    (void)arg;
     ESP_LOGI(TAG, "Starting LVGL task");
     uint32_t time_till_next_ms = 0;
     while (1) {
         _lock_acquire(&lvgl_api_lock);
         time_till_next_ms = lv_timer_handler();
+
+#if CONFIG_EXAMPLE_LCD_TOUCH_ENABLED && CONFIG_EXAMPLE_TOUCH_CALIB_ENABLE
+        touch_calib_process_runtime_requests();
+        if (touch_calib_wizard_is_running()) {
+            time_till_next_ms = MIN(time_till_next_ms, 20);
+        }
+#endif
+
         _lock_release(&lvgl_api_lock);
         // in case of triggering a task watch dog time out
         time_till_next_ms = MAX(time_till_next_ms, EXAMPLE_LVGL_TASK_MIN_DELAY_MS);
@@ -337,6 +585,7 @@ void app_main(void)
 
     // create a lvgl display
     lv_display_t *display = lv_display_create(EXAMPLE_LCD_H_RES, EXAMPLE_LCD_V_RES);
+    s_lvgl_display = display;
 
     // alloc draw buffers used by LVGL
     // it's recommended to choose the size of the draw buffer(s) to be at least 1/10 screen sized
@@ -402,6 +651,22 @@ void app_main(void)
 #elif CONFIG_EXAMPLE_LCD_TOUCH_CONTROLLER_XPT2046
     ESP_LOGI(TAG, "Initialize touch controller XPT2046");
     ESP_ERROR_CHECK(esp_lcd_touch_new_spi_xpt2046(tp_io_handle, &tp_cfg, &tp));
+#endif
+    s_touch_pad = tp;
+
+    bool need_wizard = false;
+    touch_load_calibration_or_fallback(&need_wizard);
+
+#if CONFIG_EXAMPLE_TOUCH_CALIB_ENABLE
+    if (CONFIG_EXAMPLE_TOUCH_CALIB_FORCE_ON_BOOT) {
+        s_touch_calib_wizard_requested = true;
+    } else if (need_wizard) {
+        ESP_LOGW(TAG, "No valid touch calibration found, using legacy mapping. Run 'calib' to start wizard.");
+    }
+
+#if CONFIG_EXAMPLE_TOUCH_CALIB_UART_CMD
+    xTaskCreate(touch_calib_uart_cmd_task, "calib_cmd", 4096, NULL, 1, NULL);
+#endif
 #endif
 
     static lv_indev_t *indev;
